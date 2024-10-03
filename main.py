@@ -5,6 +5,7 @@ from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlsplit, SplitResult
 import re
 from pathlib import Path
+from tqdm import tqdm
 
 BASE_LOCATION = ""
 DIR_ROOT = Path("./canvas_content").resolve()
@@ -93,6 +94,7 @@ async def download_page(session: aiohttp.ClientSession, url: str, save_path: Pat
             return []
         content_type = content_type.split(";")[0]
 
+        save_path.parent.mkdir(parents=True, exist_ok=True)
         if content_type == "text/html": 
             text = await response.text()
             relevant_urls = await get_urls_on_page(session, text, url)
@@ -100,14 +102,21 @@ async def download_page(session: aiohttp.ClientSession, url: str, save_path: Pat
             for found_url, found_url_save_path in relevant_urls:
                 text = text.replace(found_url, found_url_save_path.as_posix())
 
-            with open("test.html", "w") as f:
-                f.write(text)
-            exit()
+            save_path.write_text(text)
             return relevant_urls
 
         else:
             print("Downloading data:", url)
-            data = await response.read()
+            content_length = int(response.headers.get("content-length", 0))
+
+            with save_path.open("wb") as f, tqdm(total=(content_length if content_length else None)) as bar:
+                data = "_"
+                while len(data):
+                    data = await response.content.read(1024)
+                    f.write(data)
+                    bar.update(len(data))
+                    await asyncio.sleep(0.1)
+            
             return []
 
 
