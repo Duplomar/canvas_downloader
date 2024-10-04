@@ -2,7 +2,7 @@ import aiohttp
 import argparse
 import asyncio
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlsplit, SplitResult
+from urllib.parse import urljoin, urlsplit, SplitResult, urlparse
 import re
 from pathlib import Path
 from tqdm import tqdm
@@ -25,6 +25,7 @@ def url_to_filename(url: str):
     return "".join(c for c in location if c.isalpha() or c.isdigit() or c==' ').rstrip()
 
 
+
 def clean_url(ref_url: str, url: str) -> str:
     fields = urlsplit(urljoin(ref_url, url))._asdict() # convert to absolute URLs and split
     fields['path'] = re.sub(r'/$', '', fields['path']) # remove trailing /
@@ -33,14 +34,16 @@ def clean_url(ref_url: str, url: str) -> str:
     return fields.geturl()
 
 
+header_sem = asyncio.Semaphore(10)
 async def get_save_directory(session: aiohttp.ClientSession, url: str) -> Path | None:
     """
     Gets the save directory for the given url. Returns None if the url should not be saved
     """
 
     save_path = None
-    async with session.head(url) as response:
-        content_type = response.headers.get("content-type", None)
+    async with header_sem:
+        async with session.head(url) as response:
+            content_type = response.headers.get("content-type", None)
 
     if not content_type:
         return None
@@ -73,7 +76,7 @@ async def get_save_directory(session: aiohttp.ClientSession, url: str) -> Path |
 
 async def get_urls_on_page(session: aiohttp.ClientSession, text: str, url: str) -> list[tuple[str, Path]]:
     soup = BeautifulSoup(text, 'lxml')
-    relevant_urls: set[tuple[str, Path]] = set()
+    relevant_urls: set[str] = set()
     for tag in soup.find_all():
         found_url: str = ""
         if tag.name in ["audio", "embed", "img", "input", "script", "source", "track", "video"]:
@@ -84,12 +87,18 @@ async def get_urls_on_page(session: aiohttp.ClientSession, text: str, url: str) 
         if len(found_url):
             found_url = clean_url(url, found_url)
             if found_url.startswith("http"):
-                if found_url not in relevant_urls:
-                    found_url_save_path = await get_save_directory(session, found_url)
-                    if found_url_save_path:
-                        relevant_urls.add((found_url, found_url_save_path.resolve().absolute()))
+                relevant_urls.add(found_url)
 
-    return list(relevant_urls)
+    urls_and_save_paths: list[tuple[str, Path]] = []
+    save_paths = await asyncio.gather(*[get_save_directory(session, found_url) for found_url in relevant_urls])
+    for found_url, save_path in zip(relevant_urls, save_paths):
+        if save_path:
+            urls_and_save_paths.append((found_url, save_path.resolve().absolute()))
+            relative_url = urlparse(found_url).path
+            if len(relative_url):
+                urls_and_save_paths.append((relative_url, save_path.resolve().absolute()))
+
+    return urls_and_save_paths
 
 
 async def download_page(session: aiohttp.ClientSession, url: str, save_path: Path) -> list[tuple[str, Path]]:
@@ -102,17 +111,22 @@ async def download_page(session: aiohttp.ClientSession, url: str, save_path: Pat
 
         if not content_type:
             return []
-        content_type = content_type.split(";")[0]
+        
+        content_type = content_type.split(";")
+        if len(content_type) > 1 and content_type[1].lower().startswith("charset="):
+            charset = content_type[1].lower().split("=", 1)[1]
+        else:
+            charset = "utf-8"
+        content_type = content_type[0]
 
         save_path.parent.mkdir(parents=True, exist_ok=True)
         if content_type == "text/html": 
             text = await response.text()
             relevant_urls = await get_urls_on_page(session, text, url)
-
             for found_url, found_url_save_path in relevant_urls:
                 text = text.replace(found_url, found_url_save_path.as_posix())
 
-            save_path.write_text(text)
+            save_path.write_text(text, encoding=charset)
             return relevant_urls
 
         else:
