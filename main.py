@@ -18,10 +18,19 @@ busy = []
 def get_location(url: str):
     return url.split("://", 1)[1]
 
+
 def url_to_filename(url: str):
     location = get_location(url)
 
     return "".join(c for c in location if c.isalpha() or c.isdigit() or c==' ').rstrip()
+
+
+def clean_url(ref_url: str, url: str) -> str:
+    fields = urlsplit(urljoin(ref_url, url))._asdict() # convert to absolute URLs and split
+    fields['path'] = re.sub(r'/$', '', fields['path']) # remove trailing /
+    fields['fragment'] = '' # remove targets within a page
+    fields = SplitResult(**fields)
+    return fields.geturl()
 
 
 async def get_save_directory(session: aiohttp.ClientSession, url: str) -> Path | None:
@@ -66,18 +75,19 @@ async def get_urls_on_page(session: aiohttp.ClientSession, text: str, url: str) 
     soup = BeautifulSoup(text, 'lxml')
     relevant_urls: set[tuple[str, Path]] = set()
     for tag in soup.find_all():
-        found_url: str|None = None
+        found_url: str = ""
         if tag.name in ["audio", "embed", "img", "input", "script", "source", "track", "video"]:
-            found_url = tag.get("src", None)
+            found_url = tag.get("src", "")
         elif tag.name in ["a", "link", "area"]:
-            found_url = tag.get("href", None)
+            found_url = tag.get("href", "")
 
-        if found_url and found_url.startswith("http"):
+        if len(found_url):
             found_url = clean_url(url, found_url)
-            if found_url not in relevant_urls:
-                found_url_save_path = await get_save_directory(session, found_url)
-                if found_url_save_path:
-                    relevant_urls.add((clean_url(url, found_url), found_url_save_path))
+            if found_url.startswith("http"):
+                if found_url not in relevant_urls:
+                    found_url_save_path = await get_save_directory(session, found_url)
+                    if found_url_save_path:
+                        relevant_urls.add((found_url, found_url_save_path.resolve().absolute()))
 
     return list(relevant_urls)
 
@@ -109,24 +119,14 @@ async def download_page(session: aiohttp.ClientSession, url: str, save_path: Pat
             print("Downloading data:", url)
             content_length = int(response.headers.get("content-length", 0))
 
-            with save_path.open("wb") as f, tqdm(total=(content_length if content_length else None)) as bar:
+            with save_path.open("wb") as f:
                 data = "_"
                 while len(data):
                     data = await response.content.read(1024)
                     f.write(data)
-                    bar.update(len(data))
                     await asyncio.sleep(0.1)
             
             return []
-
-
-
-def clean_url(ref_url: str, url: str) -> str:
-    fields = urlsplit(urljoin(ref_url, url))._asdict() # convert to absolute URLs and split
-    fields['path'] = re.sub(r'/$', '', fields['path']) # remove trailing /
-    fields['fragment'] = '' # remove targets within a page
-    fields = SplitResult(**fields)
-    return fields.geturl()
 
 
 async def worker(id: int, session: aiohttp.ClientSession):
@@ -164,18 +164,19 @@ async def main():
 
     global BASE_LOCATION, busy
     BASE_LOCATION = get_location(args.base_url)
-    await queue.put((
-        args.entry_url, 
-        (DIR_ROOT / "internal_content") / get_location(args.entry_url)[len(BASE_LOCATION):], 
-        args.max_depth
-    ))
-    seen.add(args.entry_url)
-    busy.extend([False] * args.n)
-    
+
     async with aiohttp.ClientSession() as session:
+        entry_save_path = await get_save_directory(session, args.entry_url)
+        await queue.put((
+            args.entry_url, 
+            entry_save_path, 
+            args.max_depth
+        ))
+        seen.add(args.entry_url)
+        busy.extend([False] * args.n)
+        
         await asyncio.gather(*[worker(i, session) for i in range(args.n)])
 
 
 if __name__ == "__main__":
     asyncio.run(main())
-    print(seen)
